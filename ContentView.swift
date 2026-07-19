@@ -5,8 +5,10 @@
 //  Created by Samuel Couch on 7/18/26.
 //
 
+import AVFoundation
 import Network
 import SwiftUI
+import UIKit
 import UserNotifications
 
 enum Reader: String, CaseIterable, Identifiable {
@@ -20,12 +22,12 @@ enum Reader: String, CaseIterable, Identifiable {
         case .sam:
             return .yellow
         case .liana:
-            return .blue
+            return .mint
         }
     }
 
     var textColor: Color {
-        self == .sam ? .black : .white
+        .black
     }
 
     var otherReader: Reader {
@@ -112,6 +114,7 @@ struct ContentView: View {
     @State private var didReadToday = false
     @State private var showingSettings = false
     @State private var fireworksTrigger = 0
+    @State private var pokePopTrigger = 0
     @State private var isConnected = true
     @State private var monitor: NWPathMonitor?
 
@@ -265,6 +268,25 @@ struct ContentView: View {
     private func hasReadToday(_ reader: Reader) -> Bool {
         guard let lastReadDate = lastReadDate(for: reader) else { return false }
         return Calendar.current.isDateInToday(lastReadDate)
+    }
+
+    private func missedPlannedReadingDay(since lastReadDate: Date, for reader: Reader, now: Date = Date()) -> Bool {
+        let plannedDays = selectedReadingDays(for: reader)
+        guard !plannedDays.isEmpty else { return false }
+
+        var dayToCheck = Calendar.current.startOfDay(for: lastReadDate)
+        let today = Calendar.current.startOfDay(for: now)
+
+        while let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: dayToCheck), nextDay < today {
+            let weekday = Calendar.current.component(.weekday, from: nextDay)
+            if plannedDays.contains(weekday) {
+                return true
+            }
+
+            dayToCheck = nextDay
+        }
+
+        return false
     }
 
     private func lastPokeDate(for reader: Reader) -> Date? {
@@ -453,6 +475,10 @@ struct ContentView: View {
                         .padding(.vertical, 10)
                         .foregroundStyle(pokeDisabled ? Color.secondary : reader.textColor)
                         .background(pokeDisabled ? Color(.tertiarySystemFill) : reader.color, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(alignment: .center) {
+                            PokePop(trigger: pokePopTrigger, color: reader.color)
+                                .allowsHitTesting(false)
+                        }
                 }
                 .buttonStyle(.plain)
                 .disabled(pokeDisabled)
@@ -591,7 +617,7 @@ struct ContentView: View {
         let now = Date()
         let lastReadDate = lastReadDate(for: reader)
 
-        if let lastReadDate, Calendar.current.isDateInYesterday(lastReadDate) {
+        if let lastReadDate, !missedPlannedReadingDay(since: lastReadDate, for: reader, now: now) {
             setCurrentStreak(currentStreak(for: reader) + 1, for: reader)
         } else if !hasReadToday(reader) {
             setCurrentStreak(1, for: reader)
@@ -600,11 +626,14 @@ struct ContentView: View {
         setLastReadDate(now, for: reader)
         didReadToday = true
         fireworksTrigger += 1
+        CelebrationFeedback.play()
         sendLocalAccountabilityNotification(from: reader)
     }
 
     private func pokeOtherReader(from reader: Reader) {
         setLastPokeDate(Date(), for: reader)
+        pokePopTrigger += 1
+        PokeFeedback.play()
         sendLocalPokeNotification(from: reader)
     }
 
@@ -614,8 +643,12 @@ struct ContentView: View {
             fireworksTrigger = 0
         }
 
-        guard let lastReadDate = lastReadDate(for: reader) else { return }
-        if !Calendar.current.isDateInToday(lastReadDate) && !Calendar.current.isDateInYesterday(lastReadDate) {
+        guard let lastReadDate = lastReadDate(for: reader) else {
+            setCurrentStreak(0, for: reader)
+            return
+        }
+
+        if missedPlannedReadingDay(since: lastReadDate, for: reader) {
             setCurrentStreak(0, for: reader)
         }
     }
@@ -681,6 +714,197 @@ struct ContentView: View {
         }
         newMonitor.start(queue: DispatchQueue(label: "didyaread.network"))
         monitor = newMonitor
+    }
+}
+
+enum CelebrationFeedback {
+    private static var audioPlayer: AVAudioPlayer?
+
+    static func play() {
+        playJingle()
+        playHaptics()
+    }
+
+    private static func playJingle() {
+        guard let data = makeJingleData() else { return }
+
+        do {
+            audioPlayer = try AVAudioPlayer(data: data)
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+        } catch {
+            audioPlayer = nil
+        }
+    }
+
+    private static func playHaptics() {
+        let generator = UIImpactFeedbackGenerator(style: .medium)
+        generator.prepare()
+        generator.impactOccurred()
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(120))
+            generator.impactOccurred()
+        }
+    }
+
+    private static func makeJingleData() -> Data? {
+        let sampleRate = 44_100
+        let notes: [(frequency: Double, duration: Double)] = [
+            (523.25, 0.09),
+            (659.25, 0.10),
+            (783.99, 0.17)
+        ]
+
+        var samples: [Int16] = []
+        for note in notes {
+            let count = Int(Double(sampleRate) * note.duration)
+
+            for sampleIndex in 0..<count {
+                let time = Double(sampleIndex) / Double(sampleRate)
+                let position = Double(sampleIndex) / Double(count)
+                let attack = min(1, position / 0.12)
+                let release = pow(max(0, 1 - position), 2.2)
+                let envelope = attack * release
+                let wave = sin(2 * Double.pi * note.frequency * time)
+                let softOvertone = sin(2 * Double.pi * note.frequency * 2 * time) * 0.08
+                samples.append(Int16((wave + softOvertone) * envelope * 8_200))
+            }
+        }
+
+        return AudioData.makeWAVData(samples: samples, sampleRate: sampleRate)
+    }
+}
+
+enum PokeFeedback {
+    private static var audioPlayer: AVAudioPlayer?
+
+    static func play() {
+        playPop()
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred()
+    }
+
+    private static func playPop() {
+        let data = NSDataAsset(name: "PokePopSound")?.data ?? makePopData()
+        guard let data else { return }
+
+        do {
+            audioPlayer = try AVAudioPlayer(data: data)
+            audioPlayer?.volume = 1.35
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+        } catch {
+            audioPlayer = nil
+        }
+    }
+
+    private static func makePopData() -> Data? {
+        let sampleRate = 44_100
+        let count = Int(Double(sampleRate) * 0.075)
+        var samples: [Int16] = []
+
+        for sampleIndex in 0..<count {
+            let position = Double(sampleIndex) / Double(count)
+            let time = Double(sampleIndex) / Double(sampleRate)
+            let frequency = 920 - (position * 430)
+            let envelope = pow(max(0, 1 - position), 5.2)
+            let pop = sin(2 * Double.pi * frequency * time)
+            let click = sampleIndex < 80 ? 0.34 * (1 - Double(sampleIndex) / 80) : 0
+            samples.append(Int16((pop * envelope + click) * 16_000))
+        }
+
+        return AudioData.makeWAVData(samples: samples, sampleRate: sampleRate)
+    }
+}
+
+enum AudioData {
+    static func makeWAVData(samples: [Int16], sampleRate: Int) -> Data? {
+        var data = Data()
+        let byteRate = sampleRate * 2
+        let blockAlign: UInt16 = 2
+        let bitsPerSample: UInt16 = 16
+        let dataSize = UInt32(samples.count * 2)
+        let chunkSize = UInt32(36) + dataSize
+
+        data.append(contentsOf: "RIFF".utf8)
+        data.appendLittleEndian(chunkSize)
+        data.append(contentsOf: "WAVE".utf8)
+        data.append(contentsOf: "fmt ".utf8)
+        data.appendLittleEndian(UInt32(16))
+        data.appendLittleEndian(UInt16(1))
+        data.appendLittleEndian(UInt16(1))
+        data.appendLittleEndian(UInt32(sampleRate))
+        data.appendLittleEndian(UInt32(byteRate))
+        data.appendLittleEndian(blockAlign)
+        data.appendLittleEndian(bitsPerSample)
+        data.append(contentsOf: "data".utf8)
+        data.appendLittleEndian(dataSize)
+
+        for sample in samples {
+            data.appendLittleEndian(UInt16(bitPattern: sample))
+        }
+
+        return data
+    }
+}
+
+extension Data {
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var littleEndianValue = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndianValue) { bytes in
+            append(contentsOf: bytes)
+        }
+    }
+}
+
+struct PokePop: View {
+    let trigger: Int
+    let color: Color
+
+    @State private var isVisible = false
+    @State private var scale: CGFloat = 0.35
+    @State private var opacity = 0.0
+
+    var body: some View {
+        ZStack {
+            if isVisible {
+                Circle()
+                    .stroke(color, lineWidth: 3)
+                    .frame(width: 28, height: 28)
+                    .scaleEffect(scale)
+                    .opacity(opacity)
+
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                    .scaleEffect(max(0.1, 1.15 - scale * 0.35))
+                    .opacity(opacity)
+            }
+        }
+        .onChange(of: trigger) { _, newValue in
+            guard newValue > 0 else { return }
+
+            isVisible = false
+            scale = 0.35
+            opacity = 0
+
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(15))
+                isVisible = true
+                opacity = 1
+
+                withAnimation(.easeOut(duration: 0.28)) {
+                    scale = 2.1
+                    opacity = 0
+                }
+
+                try? await Task.sleep(for: .milliseconds(320))
+                isVisible = false
+                scale = 0.35
+            }
+        }
     }
 }
 
